@@ -41,6 +41,7 @@
 #include "strv.h"
 #include "terminal-util.h"
 #include "varlink-util.h"
+#include "varlink-io.systemd.Sysinstall.h"
 
 static char *arg_node = NULL;
 static bool arg_welcome = true;
@@ -58,6 +59,7 @@ static bool arg_copy_keymap = true;
 static bool arg_copy_timezone = true;
 static bool arg_chrome = true;
 static bool arg_mute_console = false;
+static bool arg_varlink = false;
 
 STATIC_DESTRUCTOR_REGISTER(arg_node, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_definitions, strv_freep);
@@ -294,6 +296,13 @@ static int parse_argv(int argc, char *argv[]) {
                 arg_definitions = strv_copy(CONF_PATHS_STRV("repart.sysinstall.d"));
                 if (!arg_definitions)
                         return log_oom();
+        }
+
+        r = sd_varlink_invocation(SD_VARLINK_ALLOW_ACCEPT);
+        if (r < 0)
+                return log_error_errno(r, "Failed to check if invoked in Varlink mode: %m");
+        if (r > 0) {
+                arg_varlink = true;
         }
 
         return 1;
@@ -1232,6 +1241,269 @@ static const ImagePolicy image_policy = {
         .default_flags = PARTITION_POLICY_IGNORE,
 };
 
+static int fetch_candidate_devices_reply(sd_varlink *repart_link,
+                                         sd_json_variant *reply,
+                                         const char *error_id,
+                                         sd_varlink_reply_flags_t flags,
+                                         void *userdata) {
+        sd_varlink *link = ASSERT_PTR(userdata);
+
+        if (error_id) {
+                return sd_varlink_error(link, error_id, NULL);
+        }
+
+        if (FLAGS_SET(flags, SD_VARLINK_REPLY_CONTINUES))
+                return sd_varlink_notify(link, reply);
+        else
+                return sd_varlink_reply(link, reply);
+
+}
+
+static int vl_method_list_candidate_devices(
+                sd_varlink *link,
+                sd_json_variant *parameters,
+                sd_varlink_method_flags_t flags,
+                void *userdata) {
+        int r;
+        _cleanup_(sd_varlink_flush_close_unrefp) sd_varlink *repart_link = NULL;
+
+        r = connect_to_repart(&repart_link);
+        if (r < 0)
+                return r;
+
+        sd_varlink_set_userdata(repart_link, link);
+        sd_varlink_bind_reply(repart_link, fetch_candidate_devices_reply);
+        r = sd_varlink_observebo(
+                        repart_link,
+                        "io.systemd.Repart.ListCandidateDevices",
+                        SD_JSON_BUILD_PAIR_BOOLEAN("ignoreRoot", true));
+
+        // TODO: report varlink error
+        if (r < 0)
+                return log_error_errno(r, "Failed to issue io.systemd.Repart.ListCandidateDevices() varlink call: %m");
+
+        for (;;) {
+                r = sd_varlink_is_idle(repart_link);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to check if varlink connection is idle: %m");
+                if (r > 0)
+                        break;
+
+                r = sd_varlink_process(repart_link);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to process varlink connection: %m");
+                if (r != 0)
+                        continue;
+
+                r = sd_varlink_wait(repart_link, USEC_INFINITY);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to wait for varlink connection events: %m");
+        }
+
+        sd_varlink_set_userdata(repart_link, NULL);
+
+        // TODO: What should we return here?
+        return 0;
+}
+
+typedef struct RunParameters {
+        char *node;
+        bool summary;
+        char **definitions;
+        bool erase;
+        bool variables;
+        const char *kernel;
+        const char *kernel_version;
+        bool copy_locale;
+        bool copy_keymap;
+        bool copy_timezone;
+} RunParameters;
+
+static void run_parameters_done(RunParameters *p) {
+        assert(p);
+
+        p->node = mfree(p->node);
+        p->definitions = strv_free(p->definitions);
+}
+
+static int vl_method_run(
+                sd_varlink *link,
+                sd_json_variant *parameters,
+                sd_varlink_method_flags_t flags,
+                void *userdata) {
+
+        // TODO: Also allow to use set credential, load credential
+        static const sd_json_dispatch_field dispatch_table[] = {
+                { "node",                        SD_JSON_VARIANT_STRING,  sd_json_dispatch_string,     offsetof(RunParameters, node),                           SD_JSON_NULLABLE                 },
+                { "summary",                     SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_stdbool,    offsetof(RunParameters, erase),                          SD_JSON_MANDATORY                },
+                { "definitions",                 SD_JSON_VARIANT_ARRAY,   json_dispatch_strv_path,     offsetof(RunParameters, definitions),                    SD_JSON_MANDATORY|SD_JSON_STRICT },
+                { "erase",                       SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_stdbool,    offsetof(RunParameters, erase),                          SD_JSON_MANDATORY                },
+                { "variables",                   SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_stdbool,    offsetof(RunParameters, variables),                      SD_JSON_MANDATORY                },
+                { "kernel",                      SD_JSON_VARIANT_STRING,  json_dispatch_const_path,    offsetof(RunParameters, kernel),                         SD_JSON_MANDATORY|SD_JSON_STRICT },
+                { "kernelVersion",              SD_JSON_VARIANT_STRING,  json_dispatch_const_version, offsetof(RunParameters, kernel_version),                 SD_JSON_MANDATORY|SD_JSON_STRICT },
+                { "copyLocale",                  SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_stdbool,    offsetof(RunParameters, copy_locale),                    SD_JSON_NULLABLE                 },
+                { "copyKeymap",                  SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_stdbool,    offsetof(RunParameters, copy_keymap),                    SD_JSON_NULLABLE                 },
+                { "copyTimezone",                SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_stdbool,    offsetof(RunParameters, copy_timezone),                  SD_JSON_NULLABLE                 },
+                {}
+        };
+
+        int r;
+
+        assert(link);
+
+        // TODO: use polkit
+
+        _cleanup_(run_parameters_done) RunParameters p = {};
+        r = sd_varlink_dispatch(link, parameters, dispatch_table, &p);
+        if (r != 0)
+                return r;
+
+        arg_touch_variables = p.variables;
+        arg_copy_locale = p.copy_locale;
+        arg_copy_keymap = p.copy_keymap;
+        arg_copy_timezone = p.copy_timezone;
+
+        _cleanup_(sd_varlink_flush_close_unrefp) sd_varlink *repart_link = NULL;
+
+        // TODO: set validate block device progress
+
+        uint64_t min_size = UINT64_MAX, current_size = UINT64_MAX, need_free = UINT64_MAX;
+        r = invoke_repart(
+                          &repart_link,
+                          p.node,
+                          p.erase,
+                          /* dry_run= */ true,
+                          &min_size,
+                          &current_size,
+                          &need_free);
+        if (r < 0)
+                return r;
+
+        // TODO: set load credential progress
+        r = read_credentials();
+        if (r < 0)
+                return r;
+
+        // TODO: set encrypt credential progress
+
+        _cleanup_(sd_varlink_flush_close_unrefp) sd_varlink *creds_link = NULL;
+        _cleanup_strv_free_ char **encrypted_credentials = NULL;
+        r = encrypt_credentials(&creds_link, &encrypted_credentials);
+        // TODO: return proper error
+        if (r < 0)
+                return r;
+
+        // TODO: build summary
+        r = show_summary();
+        if (r < 0)
+                return r;
+
+
+        // TODO: only go to summary
+        return sd_varlink_reply(link, NULL);
+
+        /* Do the main part of the installation */
+        r = invoke_repart(
+                        &repart_link,
+                        p.node,
+                        p.erase,
+                        /* dry_run= */ false,
+                        /* min_size= */ NULL,
+                        /* current_size= */ NULL,
+                        /* need_free= */ NULL);
+        if (r < 0)
+                return r;
+
+        // TODO: Update state: Mounting partitions
+
+        _cleanup_(loop_device_unrefp) LoopDevice *loop_device = NULL;
+        _cleanup_(umount_and_freep) char *root_dir = NULL;
+        _cleanup_close_ int root_fd = -EBADF;
+        r = mount_image_privately_interactively(
+                        arg_node,
+                        &image_policy,
+                        DISSECT_IMAGE_REQUIRE_ROOT |
+                        DISSECT_IMAGE_RELAX_VAR_CHECK |
+                        DISSECT_IMAGE_ALLOW_USERSPACE_VERITY |
+                        DISSECT_IMAGE_DISCARD_ANY |
+                        DISSECT_IMAGE_GPT_ONLY |
+                        DISSECT_IMAGE_FSCK |
+                        DISSECT_IMAGE_USR_NO_ROOT |
+                        DISSECT_IMAGE_ADD_PARTITION_DEVICES |
+                        DISSECT_IMAGE_PIN_PARTITION_DEVICES,
+                        &root_dir,
+                        &root_fd,
+                        &loop_device);
+        if (r < 0)
+                return log_error_errno(r, "Failed to mount new image: %m");
+
+        // TODO: Update state: Installing kernel
+
+        _cleanup_(sd_varlink_flush_close_unrefp) sd_varlink *kernel_install_link = NULL;
+        r = invoke_kernel_install(&kernel_install_link, root_dir, root_fd, encrypted_credentials);
+        if (r < 0)
+                return r;
+
+        // TODO: Update state: Installing boot loader
+
+        _cleanup_(sd_varlink_flush_close_unrefp) sd_varlink *bootctl_link = NULL;
+        r = invoke_bootctl(&bootctl_link, root_dir, root_fd);
+        if (r < 0)
+                return r;
+
+        // TODO: update state: unmounting partitions
+
+        root_fd = safe_close(root_fd);
+        r = umount_recursive(root_dir, /* flags= */ 0);
+        if (r < 0)
+                log_warning_errno(r, "Failed to unmount target disk, proceeding anyway: %m");
+        loop_device = loop_device_unref(loop_device);
+        sync();
+
+        // UPDATE state finished and succeded
+
+        /* we shouldn't reboot
+        r = maybe_reboot();
+        if (r < 0)
+                return r;
+                */
+
+        return sd_varlink_reply(link, NULL);
+}
+
+
+
+static int vl_server(void) {
+        _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *varlink_server = NULL;
+        int r;
+
+        /* Invocation as Varlink service */
+
+        r = varlink_server_new(
+                        &varlink_server,
+                        SD_VARLINK_SERVER_ACCOUNT_UID,
+                        /* userdata= */ NULL);
+        if (r < 0)
+                return log_error_errno(r, "Failed to allocate Varlink server: %m");
+
+        r = sd_varlink_server_add_interface(varlink_server, &vl_interface_io_systemd_Sysinstall);
+        if (r < 0)
+                return log_error_errno(r, "Failed to add Varlink interface: %m");
+
+        r = sd_varlink_server_bind_method_many(
+                        varlink_server,
+                        "io.systemd.Sysinstall.ListCandidateDevices", vl_method_list_candidate_devices,
+                        "io.systemd.Sysinstall.Run",                  vl_method_run);
+        if (r < 0)
+                return log_error_errno(r, "Failed to bind Varlink methods: %m");
+
+        r = sd_varlink_server_loop_auto(varlink_server);
+        if (r < 0)
+                return log_error_errno(r, "Failed to run Varlink event loop: %m");
+
+        return 0;
+}
+
 static int run(int argc, char *argv[]) {
         int r;
 
@@ -1242,6 +1514,9 @@ static int run(int argc, char *argv[]) {
                 return r;
 
         log_setup();
+
+        if (arg_varlink)
+                return vl_server();
 
         _cleanup_(sd_varlink_flush_close_unrefp) sd_varlink *mute_console_link = NULL;
         if (arg_welcome)  {

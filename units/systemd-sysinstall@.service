@@ -10,14 +10,11 @@
 [Unit]
 Description=System Install Tool
 Documentation=man:systemd-sysinstall(1)
-Wants=dbus.socket systemd-logind.service systemd-mute-console.socket
-After=systemd-logind.service
+DefaultDependencies=no
+Wants=modprobe@loop.service modprobe@dm_mod.service
+After=modprobe@loop.service modprobe@dm_mod.service systemd-tpm2-setup-early.service
+Conflicts=shutdown.target
+Before=shutdown.target
 
 [Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=systemd-sysinstall --variables=yes --reboot=yes --mute-console=yes
-StandardOutput=tty
-StandardInput=tty
-StandardError=tty
-TTYReset=yes
+ExecStart=systemd-sysinstall
