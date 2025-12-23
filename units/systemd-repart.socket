@@ -18,6 +18,6 @@ Before=shutdown.target
 [Socket]
 ListenStream=/run/systemd/io.systemd.Repart
 FileDescriptorName=varlink
-SocketMode=0600
+SocketMode=0666
 Accept=yes
 MaxConnectionsPerSource=16
