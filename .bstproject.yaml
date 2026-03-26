@@ -1,0 +1,4 @@
+projects:
+- project-path: /home/julian/code/gnome-build-meta
+  element-name: core-deps/systemd-base.bst
+format-version: 1
