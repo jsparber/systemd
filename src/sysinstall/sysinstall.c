@@ -14,6 +14,7 @@
 #include "build.h"
 #include "bus-error.h"
 #include "bus-locator.h"
+#include "bus-polkit.h"
 #include "constants.h"
 #include "dissect-image.h"
 #include "env-file.h"
@@ -21,6 +22,7 @@
 #include "fd-util.h"
 #include "format-table.h"
 #include "format-util.h"
+#include "hashmap.h"
 #include "image-policy.h"
 #include "json-util.h"
 #include "locale-setup.h"
@@ -307,22 +309,21 @@ static int parse_argv(int argc, char *argv[]) {
         return 1;
 }
 
-static int verify_polkit(sd_varlink *link, sd_json_variant *parameters, const char *action) {
+static int verify_polkit(sd_varlink *link, sd_json_variant *parameters, const char *action, Hashmap **polkit_registry) {
         int r;
-        Manager *m = ASSERT_PTR(sd_varlink_get_userdata(ASSERT_PTR(link)));
 
         assert(action);
 
-        r = sd_varlink_dispatch(link, parameters, dispatch_table_polkit_only, /* userdata= */ NULL);
+        r = sd_varlink_dispatch(link, parameters, dispatch_table_polkit_only, /* userdata= */ polkit_registry);
         if (r != 0)
                 return r;
 
         return varlink_verify_polkit_async(
                                 link,
-                                m->bus,
+                                /* bus= */ NULL,
                                 action,
                                 /* details= */ NULL,
-                                &m->polkit_registry);
+                                polkit_registry);
 }
 
 static int print_welcome(sd_varlink **mute_console_link) {
@@ -1283,6 +1284,12 @@ static int vl_method_list_candidate_devices(
         int r;
         _cleanup_(sd_varlink_flush_close_unrefp) sd_varlink *repart_link = NULL;
 
+        Hashmap **polkit_registry = ASSERT_PTR(userdata);
+
+        r = verify_polkit(link, parameters, "io.systemd.sysinstall1.ListCandidateDevices", polkit_registry);
+        if (r <= 0)
+                return r;
+
         r = connect_to_repart(&repart_link);
         if (r < 0)
                 return r;
@@ -1367,7 +1374,8 @@ static int vl_method_run(
 
         assert(link);
 
-        r = verify_polkit(link, parameters, "org.freedesktop.sysinstall1.run");
+        Hashmap **polkit_registry = ASSERT_PTR(userdata);
+        r = verify_polkit(link, parameters, "io.systemd.sysinstall1.Run", polkit_registry);
         if (r <= 0)
                 return r;
 
@@ -1493,14 +1501,15 @@ static int vl_method_run(
 
 static int vl_server(void) {
         _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *varlink_server = NULL;
+        _cleanup_hashmap_free_ Hashmap *polkit_registry = NULL;
         int r;
 
         /* Invocation as Varlink service */
 
         r = varlink_server_new(
                         &varlink_server,
-                        SD_VARLINK_SERVER_ACCOUNT_UID,
-                        /* userdata= */ NULL);
+                        SD_VARLINK_SERVER_INHERIT_USERDATA,
+                        /* userdata= */ &polkit_registry);
         if (r < 0)
                 return log_error_errno(r, "Failed to allocate Varlink server: %m");
 
