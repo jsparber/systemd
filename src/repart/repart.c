@@ -7673,6 +7673,48 @@ static int finalize_extra_mkfs_options(const Partition *p, const char *root, cha
         return 0;
 }
 
+/*
+static int context_block_device_replace(Context *context) {
+        int r;
+        const char *try1 = NULL;
+        dev_t devno_source, devno_target;
+        _cleanup_(sd_device_unrefp) sd_device *d = NULL;
+
+        // Get current volume backing /usr
+        replacement->mountpoint_fd = xopenat(AT_FDCWD, p->block_device_replace, O_RDONLY|O_CLOEXEC|O_NONBLOCK|O_NOCTTY);
+        r = find_backing_devno(PARTITION, "/usr/", &devno_source);
+        if (r < 0)
+                // TODO: error message
+                return log_error_errno(r, "Failed to find device backing /usr/ to replace %m");
+
+        LIST_FOREACH(partitions, p, context->partitions) {
+                _cleanup_(partition_target_freep) PartitionTarget *t = NULL;
+                const char *node;
+                // Get new volume devnum that will back /usr
+                // TODO: get new device number
+
+                r = sd_device_new_from_devname(&d, node);
+                if (ERRNO_IS_NEG_DEVICE_ABSENT(r)) {
+                        //log_debug_errno(r, "Device %s referenced in %s property not found, skipping: %m", node, property);
+                        //goto not_found;
+                        continue;
+                }
+
+                r = sd_device_get_devnum(devno_target, node)
+                        return log_error_errno(r, "Failed to get device number for '%s': %m", node);
+                if (r < 0)
+                        continue;
+        }
+                        // TODO: update params
+                        // TODO: reload params
+}
+*/
+
+static int find_backing_devno(
+                const char *path,
+                const char *root,
+                dev_t *ret);
+
 static int context_block_device_replace(Context *context) {
         int r;
 
@@ -7686,6 +7728,19 @@ static int context_block_device_replace(Context *context) {
 
                 if (PARTITION_EXISTS(p))
                         continue;
+
+                /* Use device mapper for replace */
+                if (p->block_device_replace && !p->btrfs_replaced) {
+                        dev_t devno_source;
+                        // FIXME: root should probably just NULL
+                        r = find_backing_devno(p->block_device_replace, "/", &devno_source);
+                        if (r < 0)
+                                // TODO: error message
+                                return log_error_errno(r, "Failed to find device backing /usr/ to replace %m");
+
+                        //FORMAT_DEVNUM
+                        printf("Devid of device to be replaced: %u, minor: %u\n", (unsigned int)major(devno_source), (unsigned int)minor(devno_source));
+                }
 
                 if (!p->btrfs_replaced)
                         continue;
@@ -8955,6 +9010,8 @@ static int context_write_partition_table(Context *context) {
         if (r < 0)
                 goto error;
 
+        // TODO: swap usr
+
         r = context_mangle_partitions(context);
         if (r < 0)
                 goto error;
@@ -9329,17 +9386,23 @@ static int find_backing_devno(
         if (r < 0)
                 return r;
 
+        printf("Is mount point?\n");
         r = path_is_mount_point(resolved);
         if (r < 0)
                 return r;
         if (r == 0) /* Not a mount point, then it's not a partition of its own, let's not automatically use it. */
                 return -ENOENT;
 
+
+        printf("Get block device mount point? %s\n", resolved);
         r = get_block_device(resolved, ret);
         if (r < 0)
                 return r;
+        printf("Devid of device: %u, minor: %u\n", (unsigned int)major(*ret), (unsigned int)minor(*ret));
+        printf("Get block device mount point? %d\n", r);
         if (r == 0) /* Not backed by physical file system, we can't use this */
                 return -ENOENT;
+        printf("Not a block device \n");
 
         return 0;
 }
@@ -9405,6 +9468,7 @@ static int resolve_copy_blocks_auto(
         }
 
         r = find_backing_devno(try1, root, &devno);
+        printf("Devid found for auto blocks: %u, minor: %u\n", (unsigned int)major(devno), (unsigned int)minor(devno));
         if (r == -ENOENT && try2)
                 r = find_backing_devno(try2, root, &devno);
         if (r < 0)
@@ -9624,11 +9688,29 @@ static int context_open_btrfs_filesystems(Context *context) {
 
         assert(context);
 
+
+        printf("\nLoop partitions\n");
+
         LIST_FOREACH(partitions, p, context->partitions) {
                 _cleanup_(btrfs_replacement_freep) BtrfsReplacement *replacement = NULL;
 
                 if (p->dropped)
                         continue;
+
+                /* Use device mapper for replace */
+                printf("Try to find devno for %s\n", p->block_device_replace);
+                if (p->block_device_replace) {
+                        dev_t devno_source;
+                        // FIXME: root should probably just NULL
+                        r = find_backing_devno(p->block_device_replace, "", &devno_source);
+                        if (r < 0)
+                                // TODO: error message
+                                return log_error_errno(r, "Failed to find device backing /usr/ to replace %m");
+
+                        //FORMAT_DEVNUM
+                        printf("Devid of device to be replaced: %u, minor: %u\n", (unsigned int)major(devno_source), (unsigned int)minor(devno_source));
+                }
+
 
                 if (PARTITION_EXISTS(p))
                         continue;
@@ -11791,6 +11873,8 @@ static int vl_method_run(
         if (r < 0)
                 return r;
 
+        // TODO: load device info
+
         r = context_acquire_partition_uuids_and_labels(context);
         if (r < 0)
                 return r;
@@ -12102,9 +12186,12 @@ static int run(int argc, char *argv[]) {
         if (r < 0)
                 return r;
 
+        printf("Do open btrfs");
         r = context_open_btrfs_filesystems(context);
         if (r < 0)
                 return r;
+
+        // TODO: load device info
 
         /* Make sure each partition has a unique UUID and unique label */
         r = context_acquire_partition_uuids_and_labels(context);

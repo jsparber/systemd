@@ -304,6 +304,16 @@ int get_block_device_fd(int fd, dev_t *ret) {
         if (fstat(fd, &st))
                 return -errno;
 
+        if (S_ISBLK(st.st_mode)) {
+            unsigned int maj = major(st.st_rdev); // Note st_rdev, NOT st_dev
+            unsigned int min = minor(st.st_rdev);
+
+            printf("is a block device with Major: %u, Minor: %u\n", maj, min);
+        } else {
+            printf("is not a block device.\n");
+        }
+
+        printf("Get block device fd: %u\n", (unsigned int)minor(st.st_dev));
         if (major(st.st_dev) != 0) {
                 *ret = st.st_dev;
                 return 1;
